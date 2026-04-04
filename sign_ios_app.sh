@@ -2,14 +2,9 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.0.20260403"
-LANG=$(defaults read -g AppleLocale 2>/dev/null || echo "en_US")
-if [[ $LANG == *"zh"* ]]; then
-    DEFAULT_LANG="zh"
-else
-    DEFAULT_LANG="en"
-fi
+SCRIPT_VERSION="1.0.20260404c"
 
+# ── 全局变量 ────────────────────────────────────────────────────────────────
 CURRENT_DIR="$(pwd)"
 TEMP_DIR=""
 CURRENT_TIME=$(date "+%Y%m%d_%H%M%S")
@@ -19,9 +14,14 @@ SIGNING_CERTIFICATE=""
 TEAM_ID=""
 BUNDLE_IDENTIFIER=""
 IPHONE_ONLY=false
+IPAD_MULTITASKING_ORIENTATIONS=true
 OVERRIDE_CERTIFICATE=""
 DISPLAY_NAME=""
 
+# 可选：LOG_TIMESTAMPS=true ./sign_ios_app.sh ... 在 CI 日志中显示时间戳
+LOG_TIMESTAMPS="${LOG_TIMESTAMPS:-false}"
+
+# ── 帮助信息 ────────────────────────────────────────────────────────────────
 show_usage() {
     local exit_code="${1:-1}"
     echo "iOS App Resign Tool v${SCRIPT_VERSION}"
@@ -34,24 +34,36 @@ show_usage() {
     echo "  -n, --name <应用显示名/name>             修改应用显示名称 / Override app display name (可选/optional)"
     echo "  -c, --certificate <证书名称/certificate> 指定签名证书 / Override signing certificate (可选/optional)"
     echo "      --iphone-only                        移除 iPad 声明，仅保留 iPhone 设备族 / Strip iPad support metadata"
-    echo "  -h, --help                              显示此帮助信息 / Show this help message"
+    echo "      --ipad-multitasking-orientations     (默认已开启) 主应用写入四方向，满足 App Store iPad 多任务校验 / Default on: 4 orientations for iPad multitasking (409)"
+    echo "      --no-ipad-multitasking-orientations  关闭上述默认行为，保留 IPA 内原有方向键 / Disable default orientation rewrite"
+    echo "  -h, --help                               显示此帮助信息 / Show this help message"
     echo
     echo "示例 / Example:"
     echo "  $0 -f app.ipa -p profile.mobileprovision -v 1.0 -b 1"
     echo "  $0 -f app.ipa -p profile.mobileprovision -v 1.0 -b 1 -n 新应用名称"
     echo "  $0 -f app.ipa -p profile.mobileprovision -v 1.0 -b 1 --iphone-only"
+    echo "  $0 -f app.ipa -p profile.mobileprovision -v 1.0 -b 1 --no-ipad-multitasking-orientations"
     exit "$exit_code"
 }
 
+# ── 日志 & 错误 ─────────────────────────────────────────────────────────────
+
+# [优化 #9] log() 支持可选时间戳，通过环境变量 LOG_TIMESTAMPS=true 开启
 log() {
-    echo "$1"
+    if [ "$LOG_TIMESTAMPS" = "true" ]; then
+        echo "[$(date '+%H:%M:%S')] $1"
+    else
+        echo "$1"
+    fi
 }
 
+# [优化 #5] 错误信息输出到 stderr，避免污染管道
 fail() {
-    echo "错误: $1"
+    echo "错误: $1" >&2
     exit 1
 }
 
+# ── 清理 ────────────────────────────────────────────────────────────────────
 cleanup() {
     if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
         rm -rf "$TEMP_DIR"
@@ -60,6 +72,7 @@ cleanup() {
 
 trap cleanup EXIT
 
+# ── 参数解析 ────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case $1 in
         -f|--file)
@@ -90,6 +103,14 @@ while [[ $# -gt 0 ]]; do
             IPHONE_ONLY=true
             shift
             ;;
+        --ipad-multitasking-orientations)
+            IPAD_MULTITASKING_ORIENTATIONS=true
+            shift
+            ;;
+        --no-ipad-multitasking-orientations)
+            IPAD_MULTITASKING_ORIENTATIONS=false
+            shift
+            ;;
         -h|--help)
             show_usage 0
             ;;
@@ -99,13 +120,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[ -n "${SOURCE_IPA:-}" ] || show_usage 1
-[ -n "${PROVISIONING_PROFILE:-}" ] || show_usage 1
-[ -n "${VERSION:-}" ] || show_usage 1
-[ -n "${BUILD:-}" ] || show_usage 1
+# ── 必填参数校验 ────────────────────────────────────────────────────────────
+[ -n "${SOURCE_IPA:-}" ]             || show_usage 1
+[ -n "${PROVISIONING_PROFILE:-}" ]   || show_usage 1
+[ -n "${VERSION:-}" ]                || show_usage 1
+[ -n "${BUILD:-}" ]                  || show_usage 1
 
-[ -f "$SOURCE_IPA" ] || fail "找不到源 IPA 文件 / Source IPA file not found: $SOURCE_IPA"
-[ -f "$PROVISIONING_PROFILE" ] || fail "找不到描述文件 / Profile file not found: $PROVISIONING_PROFILE"
+[ -f "$SOURCE_IPA" ]             || fail "找不到源 IPA 文件 / Source IPA file not found: $SOURCE_IPA"
+[ -f "$PROVISIONING_PROFILE" ]   || fail "找不到描述文件 / Profile file not found: $PROVISIONING_PROFILE"
 
 SOURCE_IPA_ABS="$(cd "$(dirname "$SOURCE_IPA")" && pwd)/$(basename "$SOURCE_IPA")"
 PROVISIONING_PROFILE_ABS="$(cd "$(dirname "$PROVISIONING_PROFILE")" && pwd)/$(basename "$PROVISIONING_PROFILE")"
@@ -114,6 +136,8 @@ IPA_NAME="${VERSION}-${BUILD}-${CURRENT_TIME}.ipa"
 TEMP_DIR="$(mktemp -d "${CURRENT_DIR}/temp_signing.XXXXXX")"
 PROFILE_PLIST="$TEMP_DIR/profile.plist"
 MAIN_ENTITLEMENTS="$TEMP_DIR/entitlements.plist"
+
+# ── 工具函数 ────────────────────────────────────────────────────────────────
 
 decode_profile() {
     local profile_path="$1"
@@ -136,15 +160,16 @@ plist_has_key() {
     /usr/libexec/PlistBuddy -c "Print $key" "$plist_path" >/dev/null 2>&1
 }
 
+# [优化 #3] 值用单引号包裹，支持含空格的字符串（如 "My App Name"）
 plist_set_string() {
     local plist_path="$1"
     local key="$2"
     local value="$3"
 
     if plist_has_key "$plist_path" "$key"; then
-        /usr/libexec/PlistBuddy -c "Set $key $value" "$plist_path"
+        /usr/libexec/PlistBuddy -c "Set $key '$value'" "$plist_path"
     else
-        /usr/libexec/PlistBuddy -c "Add $key string $value" "$plist_path"
+        /usr/libexec/PlistBuddy -c "Add $key string '$value'" "$plist_path"
     fi
 }
 
@@ -154,9 +179,9 @@ plist_set_integer() {
     local value="$3"
 
     if plist_has_key "$plist_path" "$key"; then
-        /usr/libexec/PlistBuddy -c "Set $key $value" "$plist_path"
+        /usr/libexec/PlistBuddy -c "Set $key '$value'" "$plist_path"
     else
-        /usr/libexec/PlistBuddy -c "Add $key integer $value" "$plist_path"
+        /usr/libexec/PlistBuddy -c "Add $key integer '$value'" "$plist_path"
     fi
 }
 
@@ -173,45 +198,36 @@ escape_regex() {
     printf '%s' "$1" | sed 's/[][(){}.^$+*?|\\]/\\&/g'
 }
 
-certificate_sha1_from_profile() {
-    local profile_plist="$1"
-    local index="$2"
-    local cert_tmp="$TEMP_DIR/profile-cert-$index.der"
-
-    /usr/libexec/PlistBuddy -c "Print :DeveloperCertificates:$index" "$profile_plist" > "$cert_tmp" 2>/dev/null || return 1
-    openssl x509 -inform DER -in "$cert_tmp" -noout -fingerprint -sha1 2>/dev/null | sed 's/.*=//' | tr -d ':'
-}
-
-certificate_common_name_from_profile() {
-    local profile_plist="$1"
-    local index="$2"
-    local cert_tmp="$TEMP_DIR/profile-cert-$index.der"
-
-    /usr/libexec/PlistBuddy -c "Print :DeveloperCertificates:$index" "$profile_plist" > "$cert_tmp" 2>/dev/null || return 1
-    openssl x509 -inform DER -in "$cert_tmp" -noout -subject 2>/dev/null | sed -n 's/.*CN=\(.*\), OU=.*/\1/p'
-}
-
-find_identity_by_sha1() {
-    local fingerprint="$1"
-    security find-identity -v -p codesigning 2>&1 | grep "$fingerprint" | sed -E 's/.*"([^"]+)".*/\1/' | head -n 1
-}
-
+# [优化 #2] 合并证书提取逻辑，每个证书只做一次 PlistBuddy + DER 写入
+# SHA1 匹配和 CommonName 回退均复用同一个 .der 临时文件
 find_identity_from_profile() {
     local profile_plist="$1"
     local cert_index=0
-    local cert_sha1=""
-    local identity=""
+    local cert_tmp cert_sha1 identity
 
     while true; do
-        cert_sha1="$(certificate_sha1_from_profile "$profile_plist" "$cert_index" || true)"
-        if [ -z "$cert_sha1" ]; then
-            break
+        cert_tmp="$TEMP_DIR/profile-cert-$cert_index.der"
+
+        /usr/libexec/PlistBuddy -c "Print :DeveloperCertificates:$cert_index" \
+            "$profile_plist" > "$cert_tmp" 2>/dev/null || break
+
+        cert_sha1=$(openssl x509 -inform DER -in "$cert_tmp" -noout \
+            -fingerprint -sha1 2>/dev/null | sed 's/.*=//' | tr -d ':')
+
+        identity=""
+        if [ -n "$cert_sha1" ]; then
+            identity=$(security find-identity -v -p codesigning 2>&1 \
+                | grep "$cert_sha1" \
+                | sed -E 's/.*"([^"]+)".*/\1/' \
+                | head -n 1 || true)
         fi
 
-        identity="$(find_identity_by_sha1 "$cert_sha1" || true)"
+        # SHA1 未命中则回退 CommonName
         if [ -z "$identity" ]; then
-            identity="$(certificate_common_name_from_profile "$profile_plist" "$cert_index" || true)"
+            identity=$(openssl x509 -inform DER -in "$cert_tmp" -noout -subject 2>/dev/null \
+                | sed -n 's/.*CN=\(.*\), OU=.*/\1/p' || true)
         fi
+
         if [ -n "$identity" ]; then
             echo "$identity"
             return 0
@@ -349,6 +365,23 @@ check_app_icons_for_alpha() {
     fi
 }
 
+# App Store ContentDelivery 409：支持 iPad 多任务时需在 Info.plist 中声明四种界面方向
+apply_ipad_multitasking_orientations() {
+    local app_plist="$1"
+    local key=""
+
+    log "写入 iPad 多任务四方向 (UISupportedInterfaceOrientations) / iPad multitasking orientations for App Store validation..."
+
+    for key in ":UISupportedInterfaceOrientations" ":UISupportedInterfaceOrientations~ipad"; do
+        /usr/libexec/PlistBuddy -c "Delete $key" "$app_plist" >/dev/null 2>&1 || true
+        /usr/libexec/PlistBuddy -c "Add $key array" "$app_plist"
+        /usr/libexec/PlistBuddy -c "Add ${key}:0 string UIInterfaceOrientationPortrait" "$app_plist"
+        /usr/libexec/PlistBuddy -c "Add ${key}:1 string UIInterfaceOrientationPortraitUpsideDown" "$app_plist"
+        /usr/libexec/PlistBuddy -c "Add ${key}:2 string UIInterfaceOrientationLandscapeLeft" "$app_plist"
+        /usr/libexec/PlistBuddy -c "Add ${key}:3 string UIInterfaceOrientationLandscapeRight" "$app_plist"
+    done
+}
+
 apply_main_app_metadata_overrides() {
     local app_plist="$1"
 
@@ -370,9 +403,12 @@ apply_main_app_metadata_overrides() {
         /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily:0 integer 1" "$app_plist"
         /usr/libexec/PlistBuddy -c "Delete :UISupportedInterfaceOrientations~ipad" "$app_plist" >/dev/null 2>&1 || true
         /usr/libexec/PlistBuddy -c "Delete :UIDeviceFamily~ipad" "$app_plist" >/dev/null 2>&1 || true
+    elif [ "$IPAD_MULTITASKING_ORIENTATIONS" = true ]; then
+        apply_ipad_multitasking_orientations "$app_plist"
     fi
 }
 
+# [优化 #7] 补充对 .xpc 扩展名的剥离，保证 XPC extension 能正确查找专用 Profile
 find_profile_for_bundle() {
     local bundle_path="$1"
     local bundle_name bundle_id direct_profile sibling_profile maybe_profile
@@ -380,6 +416,8 @@ find_profile_for_bundle() {
     bundle_name="$(basename "$bundle_path")"
     bundle_name="${bundle_name%.appex}"
     bundle_name="${bundle_name%.app}"
+    bundle_name="${bundle_name%.xpc}"
+
     bundle_id=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$bundle_path/Info.plist" 2>/dev/null || true)
 
     direct_profile="$CURRENT_DIR/${bundle_name}.mobileprovision"
@@ -424,6 +462,7 @@ verify_bundle_matches_profile() {
     fi
 }
 
+# [优化 #1] 调整顺序：先清理旧签名，再嵌入新 Profile，语义更清晰
 sign_bundle() {
     local bundle_path="$1"
     local profile_path="$2"
@@ -433,8 +472,8 @@ sign_bundle() {
 
     log "签名 ${bundle_type}: $(basename "$bundle_path")"
 
-    cp "$profile_path" "$bundle_path/embedded.mobileprovision"
     remove_old_signature "$bundle_path"
+    cp "$profile_path" "$bundle_path/embedded.mobileprovision"
     verify_bundle_matches_profile "$bundle_path" "$profile_plist" "$(/usr/libexec/PlistBuddy -c "Print :TeamIdentifier:0" "$profile_plist")"
 
     codesign --force --sign "$SIGNING_CERTIFICATE" \
@@ -444,6 +483,7 @@ sign_bundle() {
              "$bundle_path"
 }
 
+# [优化 #8] awk+sort+cut 中 sort key 更明确，行为完全一致
 sign_frameworks_in_dir() {
     local search_dir="$1"
     local framework_path=""
@@ -458,7 +498,7 @@ sign_frameworks_in_dir() {
                  --preserve-metadata=identifier,flags \
                  --verbose \
                  "$framework_path"
-    done < <(find "$search_dir" -type d -name "*.framework" | awk '{ print length, $0 }' | sort -rn | cut -d" " -f2-)
+    done < <(find "$search_dir" -type d -name "*.framework" | awk '{ print length, $0 }' | sort -k1,1rn | cut -d" " -f2-)
 
     while IFS= read -r framework_path; do
         log "签名动态库 / Signing dylib: $(basename "$framework_path")"
@@ -467,7 +507,7 @@ sign_frameworks_in_dir() {
                  --preserve-metadata=identifier,flags \
                  --verbose \
                  "$framework_path"
-    done < <(find "$search_dir" -type f -name "*.dylib" | awk '{ print length, $0 }' | sort -rn | cut -d" " -f2-)
+    done < <(find "$search_dir" -type f -name "*.dylib" | awk '{ print length, $0 }' | sort -k1,1rn | cut -d" " -f2-)
 }
 
 sign_nested_bundles() {
@@ -490,22 +530,37 @@ sign_nested_bundles() {
             sign_frameworks_in_dir "$nested_bundle/Frameworks"
             sign_bundle "$nested_bundle" "$PROVISIONING_PROFILE_ABS" "$PROFILE_PLIST" "$MAIN_ENTITLEMENTS" "嵌套 Bundle / Nested bundle"
         fi
-    done < <(find "$app_path" -type d \( -name "*.appex" -o -name "*.app" -o -name "*.xpc" \) ! -path "$app_path" | awk '{ print length, $0 }' | sort -rn | cut -d" " -f2-)
+    done < <(find "$app_path" -type d \( -name "*.appex" -o -name "*.app" -o -name "*.xpc" \) ! -path "$app_path" | awk '{ print length, $0 }' | sort -k1,1rn | cut -d" " -f2-)
 }
 
+# [优化 #6] 新增描述文件到期日期打印，便于排查签名后安装失败问题
 validate_final_bundle() {
     local app_path="$1"
     log "验证签名 / Verifying signature..."
     codesign --verify --deep --strict --verbose=2 "$app_path"
+
+    local expiry
+    expiry=$(/usr/libexec/PlistBuddy -c "Print :ExpirationDate" "$PROFILE_PLIST" 2>/dev/null || true)
+    if [ -n "$expiry" ]; then
+        log "描述文件到期时间 / Profile expiry date: $expiry"
+    fi
 
     if [ "$IPHONE_ONLY" = true ]; then
         log "验证 iPhone-only 元数据 / Verifying iPhone-only metadata..."
         /usr/libexec/PlistBuddy -c "Print :UIDeviceFamily" "$app_path/Info.plist"
     fi
 
+    if [ "$IPAD_MULTITASKING_ORIENTATIONS" = true ] && [ "$IPHONE_ONLY" != true ]; then
+        log "验证 iPad 多任务方向键 / Verifying iPad multitasking orientation keys..."
+        /usr/libexec/PlistBuddy -c "Print :UISupportedInterfaceOrientations" "$app_path/Info.plist"
+        /usr/libexec/PlistBuddy -c "Print :UISupportedInterfaceOrientations~ipad" "$app_path/Info.plist" 2>/dev/null || true
+    fi
+
     log "验证嵌入描述文件 / Verifying embedded profile..."
     [ -f "$app_path/embedded.mobileprovision" ] || fail "主应用缺少 embedded.mobileprovision"
 }
+
+# ── 主流程 ──────────────────────────────────────────────────────────────────
 
 log "创建临时工作目录 / Creating temporary directory: $TEMP_DIR"
 log "解压 IPA 文件 / Extracting IPA file..."
@@ -553,9 +608,6 @@ verify_bundle_matches_profile "$APP_PATH" "$PROFILE_PLIST" "$TEAM_ID"
 
 remove_plugins_directory "$APP_PATH"
 remove_swift_runtime_dylibs "$APP_PATH/Frameworks"
-
-cp "$PROVISIONING_PROFILE_ABS" "$APP_PATH/embedded.mobileprovision"
-remove_old_signature "$APP_PATH"
 
 sign_frameworks_in_dir "$APP_PATH/Frameworks"
 sign_nested_bundles "$APP_PATH"
