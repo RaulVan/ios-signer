@@ -1,1 +1,7 @@
 .history
+test
+test/
+
+*.ipa
+Payload
+*.zip

@@ -1,24 +1,65 @@
 #!/bin/bash
 
-# 显示使用方法
+set -euo pipefail
+
+SCRIPT_VERSION="1.0.20260403"
+LANG=$(defaults read -g AppleLocale 2>/dev/null || echo "en_US")
+if [[ $LANG == *"zh"* ]]; then
+    DEFAULT_LANG="zh"
+else
+    DEFAULT_LANG="en"
+fi
+
+CURRENT_DIR="$(pwd)"
+TEMP_DIR=""
+CURRENT_TIME=$(date "+%Y%m%d_%H%M%S")
+PROFILE_PLIST=""
+MAIN_ENTITLEMENTS=""
+SIGNING_CERTIFICATE=""
+TEAM_ID=""
+BUNDLE_IDENTIFIER=""
+IPHONE_ONLY=false
+OVERRIDE_CERTIFICATE=""
+DISPLAY_NAME=""
+
 show_usage() {
-    echo "使用方法: $(basename $0) [选项]"
-    echo "选项:"
-    echo "  -f, --file <ipa文件>           要签名的IPA文件 (必需)"
-    echo "  -p, --profile <描述文件>       描述文件路径 (必需)"
-    echo "  -v, --version <版本号>         版本号 (必需)"
-    echo "  -b, --build <构建号>          构建号 (必需)"
-    echo "  -h, --help                    显示此帮助信息"
+    local exit_code="${1:-1}"
+    echo "iOS App Resign Tool v${SCRIPT_VERSION}"
+    echo "使用方法 / Usage: $0 [选项/options]"
+    echo "选项 / Options:"
+    echo "  -f, --file <ipa文件/file>                要签名的IPA文件 / IPA file to sign (必需/required)"
+    echo "  -p, --profile <描述文件/profile>         主描述文件路径 / Main provisioning profile path (必需/required)"
+    echo "  -v, --version <版本号/version>           版本号 / Version number (必需/required)"
+    echo "  -b, --build <构建号/build>               构建号 / Build number (必需/required)"
+    echo "  -n, --name <应用显示名/name>             修改应用显示名称 / Override app display name (可选/optional)"
+    echo "  -c, --certificate <证书名称/certificate> 指定签名证书 / Override signing certificate (可选/optional)"
+    echo "      --iphone-only                        移除 iPad 声明，仅保留 iPhone 设备族 / Strip iPad support metadata"
+    echo "  -h, --help                              显示此帮助信息 / Show this help message"
     echo
-    echo "示例:"
-    echo "  $(basename $0) -f app.ipa -p profile.mobileprovision -v 1.0 -b 1"
+    echo "示例 / Example:"
+    echo "  $0 -f app.ipa -p profile.mobileprovision -v 1.0 -b 1"
+    echo "  $0 -f app.ipa -p profile.mobileprovision -v 1.0 -b 1 -n 新应用名称"
+    echo "  $0 -f app.ipa -p profile.mobileprovision -v 1.0 -b 1 --iphone-only"
+    exit "$exit_code"
+}
+
+log() {
+    echo "$1"
+}
+
+fail() {
+    echo "错误: $1"
     exit 1
 }
 
-# 获取当前工作目录
-CURRENT_DIR="$(pwd)"
+cleanup() {
+    if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
+        rm -rf "$TEMP_DIR"
+    fi
+}
 
-# 解析命令行参数
+trap cleanup EXIT
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         -f|--file)
@@ -37,318 +78,497 @@ while [[ $# -gt 0 ]]; do
             BUILD="$2"
             shift 2
             ;;
+        -n|--name)
+            DISPLAY_NAME="$2"
+            shift 2
+            ;;
+        -c|--certificate)
+            OVERRIDE_CERTIFICATE="$2"
+            shift 2
+            ;;
+        --iphone-only)
+            IPHONE_ONLY=true
+            shift
+            ;;
         -h|--help)
-            show_usage
+            show_usage 0
             ;;
         *)
-            echo "错误: 未知参数 $1"
-            show_usage
+            fail "未知参数 / Unknown argument: $1"
             ;;
     esac
 done
 
-# 检查必需参数
-if [ -z "$SOURCE_IPA" ] || [ -z "$PROVISIONING_PROFILE" ] || [ -z "$VERSION" ] || [ -z "$BUILD" ]; then
-    echo "错误: 缺少必需参数"
-    show_usage
-fi
+[ -n "${SOURCE_IPA:-}" ] || show_usage 1
+[ -n "${PROVISIONING_PROFILE:-}" ] || show_usage 1
+[ -n "${VERSION:-}" ] || show_usage 1
+[ -n "${BUILD:-}" ] || show_usage 1
 
-# 检查文件是否存在
-if [ ! -f "$SOURCE_IPA" ]; then
-    echo "错误: 找不到源IPA文件: $SOURCE_IPA"
-    exit 1
-fi
+[ -f "$SOURCE_IPA" ] || fail "找不到源 IPA 文件 / Source IPA file not found: $SOURCE_IPA"
+[ -f "$PROVISIONING_PROFILE" ] || fail "找不到描述文件 / Profile file not found: $PROVISIONING_PROFILE"
 
-if [ ! -f "$PROVISIONING_PROFILE" ]; then
-    echo "错误: 找不到描述文件: $PROVISIONING_PROFILE"
-    exit 1
-fi
+SOURCE_IPA_ABS="$(cd "$(dirname "$SOURCE_IPA")" && pwd)/$(basename "$SOURCE_IPA")"
+PROVISIONING_PROFILE_ABS="$(cd "$(dirname "$PROVISIONING_PROFILE")" && pwd)/$(basename "$PROVISIONING_PROFILE")"
 
-# 创建临时工作目录
-TEMP_DIR="temp_signing_$(date +%s)"
-cleanup() {
-    echo "清理工作目录..."
-    rm -f profile.plist entitlements.plist
-    if [ -d "$TEMP_DIR" ]; then
-        rm -rf "$TEMP_DIR"
+IPA_NAME="${VERSION}-${BUILD}-${CURRENT_TIME}.ipa"
+TEMP_DIR="$(mktemp -d "${CURRENT_DIR}/temp_signing.XXXXXX")"
+PROFILE_PLIST="$TEMP_DIR/profile.plist"
+MAIN_ENTITLEMENTS="$TEMP_DIR/entitlements.plist"
+
+decode_profile() {
+    local profile_path="$1"
+    local output_path="$2"
+
+    if security cms -D -i "$profile_path" > "$output_path" 2>/dev/null; then
+        return 0
+    fi
+
+    if openssl cms -inform DER -verify -noverify -in "$profile_path" -out "$output_path" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    return 1
+}
+
+plist_has_key() {
+    local plist_path="$1"
+    local key="$2"
+    /usr/libexec/PlistBuddy -c "Print $key" "$plist_path" >/dev/null 2>&1
+}
+
+plist_set_string() {
+    local plist_path="$1"
+    local key="$2"
+    local value="$3"
+
+    if plist_has_key "$plist_path" "$key"; then
+        /usr/libexec/PlistBuddy -c "Set $key $value" "$plist_path"
+    else
+        /usr/libexec/PlistBuddy -c "Add $key string $value" "$plist_path"
     fi
 }
 
-# 设置退出时的清理
-trap 'cleanup' EXIT
-trap 'cleanup' ERR
+plist_set_integer() {
+    local plist_path="$1"
+    local key="$2"
+    local value="$3"
 
-# 定义变量
-CURRENT_TIME=$(date "+%Y%m%d_%H%M%S")
-IPA_NAME="${VERSION}-${BUILD}-${CURRENT_TIME}.ipa"
+    if plist_has_key "$plist_path" "$key"; then
+        /usr/libexec/PlistBuddy -c "Set $key $value" "$plist_path"
+    else
+        /usr/libexec/PlistBuddy -c "Add $key integer $value" "$plist_path"
+    fi
+}
 
-# 创建并进入临时工作目录
-echo "创建临时工作目录: $TEMP_DIR"
-mkdir -p "$TEMP_DIR"
-cd "$TEMP_DIR"
+profile_bundle_id() {
+    local profile_plist="$1"
+    local profile_team_id="$2"
+    local app_identifier=""
 
-# 解压IPA文件
-echo "解压IPA文件..."
-unzip -q "../$SOURCE_IPA"
+    app_identifier=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:application-identifier" "$profile_plist")
+    echo "${app_identifier#${profile_team_id}.}"
+}
 
-# 检查解压后的文件夹
-echo "检查解压后的文件夹结构..."
-# 使用find命令查找所有一级目录
+escape_regex() {
+    printf '%s' "$1" | sed 's/[][(){}.^$+*?|\\]/\\&/g'
+}
+
+certificate_sha1_from_profile() {
+    local profile_plist="$1"
+    local index="$2"
+    local cert_tmp="$TEMP_DIR/profile-cert-$index.der"
+
+    /usr/libexec/PlistBuddy -c "Print :DeveloperCertificates:$index" "$profile_plist" > "$cert_tmp" 2>/dev/null || return 1
+    openssl x509 -inform DER -in "$cert_tmp" -noout -fingerprint -sha1 2>/dev/null | sed 's/.*=//' | tr -d ':'
+}
+
+certificate_common_name_from_profile() {
+    local profile_plist="$1"
+    local index="$2"
+    local cert_tmp="$TEMP_DIR/profile-cert-$index.der"
+
+    /usr/libexec/PlistBuddy -c "Print :DeveloperCertificates:$index" "$profile_plist" > "$cert_tmp" 2>/dev/null || return 1
+    openssl x509 -inform DER -in "$cert_tmp" -noout -subject 2>/dev/null | sed -n 's/.*CN=\(.*\), OU=.*/\1/p'
+}
+
+find_identity_by_sha1() {
+    local fingerprint="$1"
+    security find-identity -v -p codesigning 2>&1 | grep "$fingerprint" | sed -E 's/.*"([^"]+)".*/\1/' | head -n 1
+}
+
+find_identity_from_profile() {
+    local profile_plist="$1"
+    local cert_index=0
+    local cert_sha1=""
+    local identity=""
+
+    while true; do
+        cert_sha1="$(certificate_sha1_from_profile "$profile_plist" "$cert_index" || true)"
+        if [ -z "$cert_sha1" ]; then
+            break
+        fi
+
+        identity="$(find_identity_by_sha1 "$cert_sha1" || true)"
+        if [ -z "$identity" ]; then
+            identity="$(certificate_common_name_from_profile "$profile_plist" "$cert_index" || true)"
+        fi
+        if [ -n "$identity" ]; then
+            echo "$identity"
+            return 0
+        fi
+
+        cert_index=$((cert_index + 1))
+    done
+
+    return 1
+}
+
+warn_if_identity_precheck_unavailable() {
+    local identity="$1"
+    local pattern
+
+    pattern="$(escape_regex "$identity")"
+    if ! security find-identity -v -p codesigning 2>&1 | grep -E "\"${pattern}\"" >/dev/null 2>&1; then
+        log "警告: 当前环境无法通过 security 预校验签名证书，将继续交由 codesign 实际校验 / Warning: security precheck could not confirm identity, continuing with codesign"
+    fi
+}
+
+remove_old_signature() {
+    local target="$1"
+    rm -rf "$target/_CodeSignature"
+    [ -f "$target/CodeResources" ] && rm -f "$target/CodeResources"
+    find "$target" -name ".DS_Store" -type f -delete 2>/dev/null || true
+}
+
+prune_non_payload_content() {
+    local temp_root="$1"
+    local entry=""
+
+    log "清理 Payload 之外的内容 / Removing content outside Payload..."
+    while IFS= read -r entry; do
+        if [ -e "$entry" ]; then
+            log "删除 / Removing: $(basename "$entry")"
+            rm -rf "$entry"
+        fi
+    done < <(find "$temp_root" -mindepth 1 -maxdepth 1 ! -name "Payload")
+}
+
+remove_plugins_directory() {
+    local app_path="$1"
+    local plugins_dir="$app_path/PlugIns"
+
+    if [ -d "$plugins_dir" ]; then
+        log "删除扩展目录 / Removing PlugIns directory..."
+        rm -rf "$plugins_dir"
+    else
+        log "未发现扩展目录 / PlugIns directory not found, skipping"
+    fi
+}
+
+remove_swift_runtime_dylibs() {
+    local frameworks_dir="$1"
+    local dylib_path=""
+    local found_any=false
+
+    if [ ! -d "$frameworks_dir" ]; then
+        log "未发现 Frameworks 目录 / Frameworks directory not found, skipping libswift cleanup"
+        return 0
+    fi
+
+    while IFS= read -r dylib_path; do
+        found_any=true
+        if [ -f "$dylib_path" ]; then
+            log "删除 Swift 运行库 / Removing Swift runtime dylib: $(basename "$dylib_path")"
+            rm -f "$dylib_path"
+        fi
+    done < <(find "$frameworks_dir" -maxdepth 1 -type f -name "libswift*.dylib")
+
+    if [ "$found_any" = false ]; then
+        log "未发现 libswift 动态库 / No libswift dylibs found, skipping"
+    fi
+}
+
+collect_icon_basenames_from_plist() {
+    local app_plist="$1"
+    local temp_output="$2"
+    local icon_key=""
+    local index=0
+    local icon_name=""
+
+    : > "$temp_output"
+
+    for icon_key in ":CFBundleIcons" ":CFBundleIcons~ipad"; do
+        index=0
+        while true; do
+            icon_name=$(/usr/libexec/PlistBuddy -c "Print ${icon_key}:CFBundlePrimaryIcon:CFBundleIconFiles:${index}" "$app_plist" 2>/dev/null || true)
+            [ -n "$icon_name" ] || break
+            printf '%s\n' "$icon_name" >> "$temp_output"
+            index=$((index + 1))
+        done
+    done
+
+    sort -u "$temp_output" -o "$temp_output"
+}
+
+check_app_icons_for_alpha() {
+    local app_path="$1"
+    local app_plist="$app_path/Info.plist"
+    local icon_names_file="$TEMP_DIR/icon_names.txt"
+    local matched_icons_file="$TEMP_DIR/matched_icons.txt"
+    local icon_base=""
+    local icon_file=""
+    local found_any=false
+    local has_alpha=""
+
+    collect_icon_basenames_from_plist "$app_plist" "$icon_names_file"
+    : > "$matched_icons_file"
+
+    while IFS= read -r icon_base; do
+        [ -n "$icon_base" ] || continue
+        while IFS= read -r icon_file; do
+            [ -f "$icon_file" ] || continue
+            printf '%s\n' "$icon_file" >> "$matched_icons_file"
+        done < <(find "$app_path" -maxdepth 1 -type f \( -name "${icon_base}.png" -o -name "${icon_base}@*.png" -o -name "${icon_base}~*.png" -o -name "${icon_base}@*~*.png" \))
+    done < "$icon_names_file"
+
+    sort -u "$matched_icons_file" -o "$matched_icons_file"
+
+    while IFS= read -r icon_file; do
+        [ -f "$icon_file" ] || continue
+        found_any=true
+        has_alpha="$(sips -g hasAlpha "$icon_file" 2>/dev/null | awk -F': ' '/hasAlpha/ {print $2}')"
+        if [ "$has_alpha" = "yes" ]; then
+            fail "检测到 AppIcon 存在透明度，不符合 App Store 要求，请先修改图标后重新签名: $icon_file"
+        fi
+    done < "$matched_icons_file"
+
+    if [ "$found_any" = false ]; then
+        log "未找到可检测的 AppIcon PNG 文件 / No AppIcon PNG files found, skipping alpha check"
+    else
+        log "AppIcon 透明度检查通过 / AppIcon alpha check passed"
+    fi
+}
+
+apply_main_app_metadata_overrides() {
+    local app_plist="$1"
+
+    log "更新主应用元数据 / Updating main app metadata..."
+    plist_set_string "$app_plist" ":CFBundleIdentifier" "$BUNDLE_IDENTIFIER"
+    plist_set_string "$app_plist" ":CFBundleShortVersionString" "$VERSION"
+    plist_set_string "$app_plist" ":CFBundleVersion" "$BUILD"
+
+    if [ -n "$DISPLAY_NAME" ]; then
+        log "更新应用显示名称 / Updating app display name..."
+        plist_set_string "$app_plist" ":CFBundleDisplayName" "$DISPLAY_NAME"
+        plist_set_string "$app_plist" ":CFBundleName" "$DISPLAY_NAME"
+    fi
+
+    if [ "$IPHONE_ONLY" = true ]; then
+        log "应用 iPhone-only 修补 / Applying iPhone-only metadata patch..."
+        /usr/libexec/PlistBuddy -c "Delete :UIDeviceFamily" "$app_plist" >/dev/null 2>&1 || true
+        /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily array" "$app_plist"
+        /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily:0 integer 1" "$app_plist"
+        /usr/libexec/PlistBuddy -c "Delete :UISupportedInterfaceOrientations~ipad" "$app_plist" >/dev/null 2>&1 || true
+        /usr/libexec/PlistBuddy -c "Delete :UIDeviceFamily~ipad" "$app_plist" >/dev/null 2>&1 || true
+    fi
+}
+
+find_profile_for_bundle() {
+    local bundle_path="$1"
+    local bundle_name bundle_id direct_profile sibling_profile maybe_profile
+
+    bundle_name="$(basename "$bundle_path")"
+    bundle_name="${bundle_name%.appex}"
+    bundle_name="${bundle_name%.app}"
+    bundle_id=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$bundle_path/Info.plist" 2>/dev/null || true)
+
+    direct_profile="$CURRENT_DIR/${bundle_name}.mobileprovision"
+    [ -f "$direct_profile" ] && echo "$direct_profile" && return 0
+
+    sibling_profile="$(dirname "$PROVISIONING_PROFILE_ABS")/${bundle_name}.mobileprovision"
+    [ -f "$sibling_profile" ] && echo "$sibling_profile" && return 0
+
+    if [ -n "$bundle_id" ]; then
+        maybe_profile="$CURRENT_DIR/${bundle_id}.mobileprovision"
+        [ -f "$maybe_profile" ] && echo "$maybe_profile" && return 0
+
+        maybe_profile="$(dirname "$PROVISIONING_PROFILE_ABS")/${bundle_id}.mobileprovision"
+        [ -f "$maybe_profile" ] && echo "$maybe_profile" && return 0
+    fi
+
+    return 1
+}
+
+prepare_entitlements_from_profile() {
+    local profile_path="$1"
+    local plist_path="$2"
+    local entitlements_path="$3"
+
+    decode_profile "$profile_path" "$plist_path" || fail "无法解析描述文件 / Failed to decode profile: $profile_path"
+    /usr/libexec/PlistBuddy -x -c "Print :Entitlements" "$plist_path" > "$entitlements_path"
+}
+
+verify_bundle_matches_profile() {
+    local bundle_path="$1"
+    local profile_plist="$2"
+    local expected_team_id="$3"
+    local bundle_identifier_from_profile expected_bundle_identifier actual_bundle_identifier
+
+    bundle_identifier_from_profile="$(profile_bundle_id "$profile_plist" "$expected_team_id")"
+    actual_bundle_identifier=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$bundle_path/Info.plist")
+
+    expected_bundle_identifier="$(escape_regex "$bundle_identifier_from_profile")"
+    expected_bundle_identifier="${expected_bundle_identifier//\\*/.*}"
+    if ! printf '%s\n' "$actual_bundle_identifier" | grep -Eq "^${expected_bundle_identifier}$"; then
+        fail "Bundle ID 与描述文件不匹配 / Bundle ID does not match profile: $actual_bundle_identifier vs $bundle_identifier_from_profile"
+    fi
+}
+
+sign_bundle() {
+    local bundle_path="$1"
+    local profile_path="$2"
+    local profile_plist="$3"
+    local entitlements_path="$4"
+    local bundle_type="$5"
+
+    log "签名 ${bundle_type}: $(basename "$bundle_path")"
+
+    cp "$profile_path" "$bundle_path/embedded.mobileprovision"
+    remove_old_signature "$bundle_path"
+    verify_bundle_matches_profile "$bundle_path" "$profile_plist" "$(/usr/libexec/PlistBuddy -c "Print :TeamIdentifier:0" "$profile_plist")"
+
+    codesign --force --sign "$SIGNING_CERTIFICATE" \
+             --entitlements "$entitlements_path" \
+             --timestamp=none \
+             --verbose \
+             "$bundle_path"
+}
+
+sign_frameworks_in_dir() {
+    local search_dir="$1"
+    local framework_path=""
+
+    [ -d "$search_dir" ] || return 0
+
+    while IFS= read -r framework_path; do
+        log "签名框架 / Signing framework: $(basename "$framework_path")"
+        remove_old_signature "$framework_path"
+        codesign --force --sign "$SIGNING_CERTIFICATE" \
+                 --timestamp=none \
+                 --preserve-metadata=identifier,flags \
+                 --verbose \
+                 "$framework_path"
+    done < <(find "$search_dir" -type d -name "*.framework" | awk '{ print length, $0 }' | sort -rn | cut -d" " -f2-)
+
+    while IFS= read -r framework_path; do
+        log "签名动态库 / Signing dylib: $(basename "$framework_path")"
+        codesign --force --sign "$SIGNING_CERTIFICATE" \
+                 --timestamp=none \
+                 --preserve-metadata=identifier,flags \
+                 --verbose \
+                 "$framework_path"
+    done < <(find "$search_dir" -type f -name "*.dylib" | awk '{ print length, $0 }' | sort -rn | cut -d" " -f2-)
+}
+
+sign_nested_bundles() {
+    local app_path="$1"
+    local nested_bundle=""
+    local profile_path=""
+    local nested_profile_plist=""
+    local nested_entitlements=""
+
+    while IFS= read -r nested_bundle; do
+        profile_path="$(find_profile_for_bundle "$nested_bundle" || true)"
+        if [ -n "$profile_path" ]; then
+            nested_profile_plist="$TEMP_DIR/$(basename "$nested_bundle").profile.plist"
+            nested_entitlements="$TEMP_DIR/$(basename "$nested_bundle").entitlements.plist"
+            prepare_entitlements_from_profile "$profile_path" "$nested_profile_plist" "$nested_entitlements"
+            sign_frameworks_in_dir "$nested_bundle/Frameworks"
+            sign_bundle "$nested_bundle" "$profile_path" "$nested_profile_plist" "$nested_entitlements" "嵌套 Bundle / Nested bundle"
+        else
+            log "未找到 $(basename "$nested_bundle") 对应描述文件，回退主描述文件 / Missing dedicated profile, falling back to main profile"
+            sign_frameworks_in_dir "$nested_bundle/Frameworks"
+            sign_bundle "$nested_bundle" "$PROVISIONING_PROFILE_ABS" "$PROFILE_PLIST" "$MAIN_ENTITLEMENTS" "嵌套 Bundle / Nested bundle"
+        fi
+    done < <(find "$app_path" -type d \( -name "*.appex" -o -name "*.app" -o -name "*.xpc" \) ! -path "$app_path" | awk '{ print length, $0 }' | sort -rn | cut -d" " -f2-)
+}
+
+validate_final_bundle() {
+    local app_path="$1"
+    log "验证签名 / Verifying signature..."
+    codesign --verify --deep --strict --verbose=2 "$app_path"
+
+    if [ "$IPHONE_ONLY" = true ]; then
+        log "验证 iPhone-only 元数据 / Verifying iPhone-only metadata..."
+        /usr/libexec/PlistBuddy -c "Print :UIDeviceFamily" "$app_path/Info.plist"
+    fi
+
+    log "验证嵌入描述文件 / Verifying embedded profile..."
+    [ -f "$app_path/embedded.mobileprovision" ] || fail "主应用缺少 embedded.mobileprovision"
+}
+
+log "创建临时工作目录 / Creating temporary directory: $TEMP_DIR"
+log "解压 IPA 文件 / Extracting IPA file..."
+unzip -q "$SOURCE_IPA_ABS" -d "$TEMP_DIR"
+prune_non_payload_content "$TEMP_DIR"
+
+log "检查解压后的文件夹结构 / Checking extracted folder structure..."
 FOLDERS_TO_PACK=()
 while IFS= read -r folder; do
-    folder_name=$(basename "$folder")
-    echo "发现文件夹: $folder_name"
+    folder_name="$(basename "$folder")"
+    log "发现文件夹 / Found folder: $folder_name"
     FOLDERS_TO_PACK+=("$folder_name")
-done < <(find . -maxdepth 1 -type d ! -path "." | sort)
+done < <(find "$TEMP_DIR" -mindepth 1 -maxdepth 1 -type d | sort)
 
-if [ ${#FOLDERS_TO_PACK[@]} -eq 0 ]; then
-    echo "错误: 解压后没有找到任何文件夹"
-    exit 1
-fi
+[ ${#FOLDERS_TO_PACK[@]} -gt 0 ] || fail "解压后没有找到任何文件夹 / No folders found after extraction"
 
-# 获取实际的应用路径
-APP_PATH=$(find . -name "*.app" -type d | head -n 1)
-if [ -z "$APP_PATH" ]; then
-    echo "错误: 在IPA中找不到.app文件"
-    cd ..
-    exit 1
-fi
+APP_PATH="$(find "$TEMP_DIR/Payload" -maxdepth 1 -type d -name "*.app" | head -n 1)"
+[ -n "$APP_PATH" ] || fail "在 IPA 中找不到 .app 文件 / .app bundle not found"
 
-echo "找到应用程序包: $APP_PATH"
+log "找到应用程序包 / Found application bundle: $APP_PATH"
+decode_profile "$PROVISIONING_PROFILE_ABS" "$PROFILE_PLIST" || fail "无法解析主描述文件 / Failed to decode main profile"
 
-# 从描述文件中获取信息
-echo "从描述文件中获取信息..."
+TEAM_ID=$(/usr/libexec/PlistBuddy -c "Print :TeamIdentifier:0" "$PROFILE_PLIST")
+BUNDLE_IDENTIFIER="$(profile_bundle_id "$PROFILE_PLIST" "$TEAM_ID")"
+/usr/libexec/PlistBuddy -x -c "Print :Entitlements" "$PROFILE_PLIST" > "$MAIN_ENTITLEMENTS"
 
-# 解析描述文件获取信息
-security cms -D -i "../$PROVISIONING_PROFILE" > profile.plist
-
-# 获取证书类型
-CERT_TYPE=$(/usr/libexec/PlistBuddy -c "Print :DeveloperCertificates:0" profile.plist | openssl x509 -inform DER -noout -subject | grep "CN=" | sed 's/.*CN=\([^,]*\).*/\1/')
-echo "证书类型: $CERT_TYPE"
-
-TEAM_NAME=$(/usr/libexec/PlistBuddy -c "Print :TeamName" profile.plist)
-TEAM_ID=$(/usr/libexec/PlistBuddy -c "Print :TeamIdentifier:0" profile.plist)
-BUNDLE_IDENTIFIER=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:application-identifier" profile.plist | sed "s/^$TEAM_ID.//")
-
-# 使用从描述文件中获取的证书类型
-SIGNING_CERTIFICATE="$CERT_TYPE"
-
-echo "获取到的信息："
-echo "团队名称: $TEAM_NAME"
-echo "团队ID: $TEAM_ID"
-echo "Bundle ID: $BUNDLE_IDENTIFIER"
-echo "签名证书: $SIGNING_CERTIFICATE"
-
-# 检查证书是否存在
-echo "检查证书是否存在..."
-if security find-identity -v -p codesigning | grep "$SIGNING_CERTIFICATE" > /dev/null; then
-    echo "✅ 找到签名证书: $SIGNING_CERTIFICATE"
+if [ -n "$OVERRIDE_CERTIFICATE" ]; then
+    SIGNING_CERTIFICATE="$OVERRIDE_CERTIFICATE"
 else
-    echo "❌ 错误: 找不到有效的签名证书"
-    echo "尝试查找的证书名称:"
-    echo "$SIGNING_CERTIFICATE"
-    echo
-    echo "请确保以下事项："
-    echo "1. 证书已经导入到钥匙串中"
-    echo "2. 证书未过期"
-    echo "3. 证书名称完全匹配"
-    echo
-    echo "可用的签名证书列表："
-    security find-identity -v -p codesigning
-    cd ..
-    exit 1
+    SIGNING_CERTIFICATE="$(find_identity_from_profile "$PROFILE_PLIST" || true)"
 fi
 
-# 修改Info.plist中的包名和版本号
-echo "修改包名为: $BUNDLE_IDENTIFIER"
-echo "设置版本号: $VERSION (Build $BUILD)"
-/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_IDENTIFIER" "$APP_PATH/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP_PATH/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" "$APP_PATH/Info.plist"
+[ -n "$SIGNING_CERTIFICATE" ] || fail "无法根据描述文件匹配本地证书 / Failed to match signing identity from profile"
+warn_if_identity_precheck_unavailable "$SIGNING_CERTIFICATE"
 
-# 复制描述文件到应用程序包中
-echo "复制描述文件..."
-cp "../$PROVISIONING_PROFILE" "$APP_PATH/embedded.mobileprovision"
+log "获取到的信息 / Retrieved information:"
+log "团队 ID / Team ID: $TEAM_ID"
+log "Bundle ID: $BUNDLE_IDENTIFIER"
+log "签名证书 / Signing certificate: $SIGNING_CERTIFICATE"
 
-# 删除旧的签名文件（如果存在）
-if [ -d "$APP_PATH/_CodeSignature" ]; then
-    echo "删除旧的签名..."
-    rm -rf "$APP_PATH/_CodeSignature"
-fi
+MAIN_APP_PLIST="$APP_PATH/Info.plist"
+check_app_icons_for_alpha "$APP_PATH"
+apply_main_app_metadata_overrides "$MAIN_APP_PLIST"
+verify_bundle_matches_profile "$APP_PATH" "$PROFILE_PLIST" "$TEAM_ID"
 
-# 提取主应用描述文件中的权限
-echo "提取主应用描述文件中的权限..."
-security cms -D -i "../$PROVISIONING_PROFILE" > profile.plist
-/usr/libexec/PlistBuddy -x -c 'Print :Entitlements' profile.plist > entitlements.plist
+remove_plugins_directory "$APP_PATH"
+remove_swift_runtime_dylibs "$APP_PATH/Frameworks"
 
-# 首先签名所有嵌入的框架
-echo "开始签名框架..."
-if [ -d "$APP_PATH/Frameworks" ]; then
-    find "$APP_PATH/Frameworks" -name "*.framework" -type d | while read framework; do
-        echo "签名框架: $(basename "$framework")"
-        # 删除框架的旧签名
-        if [ -d "$framework/_CodeSignature" ]; then
-            rm -rf "$framework/_CodeSignature"
-        fi
-        # 签名框架
-        codesign --force --sign "$SIGNING_CERTIFICATE" \
-                 --timestamp=none \
-                 --preserve-metadata=identifier,entitlements,flags \
-                 --verbose "$framework"
-    done
-    
-    # 签名动态库
-    find "$APP_PATH/Frameworks" -name "*.dylib" -type f | while read dylib; do
-        echo "签名动态库: $(basename "$dylib")"
-        codesign --force --sign "$SIGNING_CERTIFICATE" \
-                 --timestamp=none \
-                 --preserve-metadata=identifier,entitlements,flags \
-                 --verbose "$dylib"
-    done
-fi
+cp "$PROVISIONING_PROFILE_ABS" "$APP_PATH/embedded.mobileprovision"
+remove_old_signature "$APP_PATH"
 
-# 检查是否存在扩展插件目录
-EXTENSIONS_DIR="$APP_PATH/PlugIns"
-HAS_EXTENSIONS=false
-if [ -d "$EXTENSIONS_DIR" ]; then
-    HAS_EXTENSIONS=true
-    echo "检测到扩展插件目录: $EXTENSIONS_DIR"
-    
-    # 列出所有扩展插件
-    echo "发现的扩展插件:"
-    find "$EXTENSIONS_DIR" -name "*.appex" -type d | while read appex; do
-        extension_name=$(basename "$appex" .appex)
-        echo "- $extension_name"
-        
-        # 检查是否有对应的描述文件
-        extension_profile="${extension_name}.mobileprovision"
-        if [ -f "$extension_profile" ]; then
-            echo "  找到对应的描述文件: $extension_profile"
-        else
-            echo "  未找到对应的描述文件，将使用主应用描述文件签名"
-        fi
-    done
-fi
+sign_frameworks_in_dir "$APP_PATH/Frameworks"
+sign_nested_bundles "$APP_PATH"
+sign_bundle "$APP_PATH" "$PROVISIONING_PROFILE_ABS" "$PROFILE_PLIST" "$MAIN_ENTITLEMENTS" "主应用 / Main app"
+validate_final_bundle "$APP_PATH"
 
-# 签名扩展插件
-echo "开始签名扩展插件..."
-if [ "$HAS_EXTENSIONS" = true ]; then
-    find "$APP_PATH/PlugIns" -name "*.appex" -type d | while read appex; do
-        extension_name=$(basename "$appex" .appex)
-        echo "处理扩展插件: $extension_name"
-        
-        # 检查是否有对应的描述文件
-        extension_profile="../${extension_name}.mobileprovision"
-        if [ -f "$extension_profile" ]; then
-            echo "使用描述文件: $extension_profile"
-            
-            # 复制描述文件到扩展插件中
-            cp "$extension_profile" "$appex/embedded.mobileprovision"
-            
-            # 提取扩展插件的权限
-            security cms -D -i "$extension_profile" > extension_profile.plist
-            /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' extension_profile.plist > extension_entitlements.plist
-            
-            # 删除扩展插件的旧签名
-            if [ -d "$appex/_CodeSignature" ]; then
-                rm -rf "$appex/_CodeSignature"
-            fi
-            
-            # 如果扩展插件有自己的框架，也需要签名
-            if [ -d "$appex/Frameworks" ]; then
-                find "$appex/Frameworks" -name "*.framework" -type d -o -name "*.dylib" -type f | while read framework; do
-                    echo "签名扩展插件框架: $(basename "$framework")"
-                    codesign --force --sign "$SIGNING_CERTIFICATE" \
-                             --timestamp=none \
-                             --preserve-metadata=identifier,entitlements,flags \
-                             --verbose "$framework"
-                done
-            fi
-            
-            # 签名扩展插件本身
-            echo "签名扩展插件: $extension_name"
-            codesign --force --sign "$SIGNING_CERTIFICATE" \
-                     --entitlements "extension_entitlements.plist" \
-                     --timestamp=none \
-                     --verbose "$appex"
-                     
-            # 清理临时文件
-            rm -f extension_profile.plist extension_entitlements.plist
-        else
-            echo "未找到扩展插件 $extension_name 的描述文件，使用主应用描述文件签名"
-            codesign --force --sign "$SIGNING_CERTIFICATE" \
-                     --entitlements "entitlements.plist" \
-                     --timestamp=none \
-                     --verbose "$appex"
-        fi
-    done
-else
-    echo "未检测到扩展插件，跳过扩展插件签名步骤"
-fi
+log "创建 IPA 文件 / Creating IPA..."
+(
+    cd "$TEMP_DIR"
+    zip -qr "$CURRENT_DIR/$IPA_NAME" "${FOLDERS_TO_PACK[@]}"
+)
 
-# 签名应用程序
-echo "使用证书 '$SIGNING_CERTIFICATE' 签名应用..."
-codesign --force --sign "$SIGNING_CERTIFICATE" \
-         --entitlements "entitlements.plist" \
-         --timestamp=none \
-         --verbose \
-         "$APP_PATH"
-
-# 验证签名
-echo "验证签名..."
-codesign -v "$APP_PATH"
-
-if [ $? -eq 0 ]; then
-    echo "✅ 签名成功完成！"
-    
-    # 验证描述文件是否存在
-    if [ -f "$APP_PATH/embedded.mobileprovision" ]; then
-        echo "✅ 描述文件已正确嵌入到应用中"
-        echo "描述文件路径: $APP_PATH/embedded.mobileprovision"
-        echo "描述文件大小: $(ls -lh "$APP_PATH/embedded.mobileprovision" | awk '{print $5}')"
-    else
-        echo "❌ 警告: 描述文件未能正确嵌入到应用中"
-        exit 1
-    fi
-    
-    # 验证框架签名
-    if [ -d "$APP_PATH/Frameworks" ]; then
-        echo "验证框架签名..."
-        find "$APP_PATH/Frameworks" -name "*.framework" -o -name "*.dylib" | while read -r framework; do
-            echo "验证: $(basename "$framework")"
-            codesign -v "$framework" || exit 1
-        done
-    fi
-    
-    # 验证扩展插件签名
-    if [ -d "$APP_PATH/PlugIns" ]; then
-        echo "验证扩展插件签名..."
-        find "$APP_PATH/PlugIns" -name "*.appex" | while read -r appex; do
-            extension_name=$(basename "$appex" .appex)
-            echo "验证扩展插件: $extension_name"
-            if [ -f "$appex/embedded.mobileprovision" ]; then
-                echo "✅ 扩展插件描述文件已正确嵌入"
-            else
-                echo "❌ 警告: 扩展插件描述文件未能正确嵌入"
-            fi
-            codesign -v "$appex" || exit 1
-        done
-    fi
-    
-    # 创建压缩包
-    echo "创建 IPA 文件..."
-    echo "打包以下文件夹: ${FOLDERS_TO_PACK[*]}"
-    zip -qr "../$IPA_NAME" "${FOLDERS_TO_PACK[@]}"
-    
-    # 返回上级目录
-    cd ..
-    
-    echo "✅ IPA 文件已生成: $IPA_NAME"
-    echo "包名: $BUNDLE_IDENTIFIER"
-    echo "版本: $VERSION (Build $BUILD)"
-    echo "包含的文件夹: ${FOLDERS_TO_PACK[*]}"
-else
-    echo "❌ 签名验证失败！"
-    cleanup
-    exit 1
-fi 
+log "✅ IPA 文件已生成 / Generated IPA: $IPA_NAME"
+log "包名 / Bundle ID: $BUNDLE_IDENTIFIER"
+log "版本 / Version: $VERSION (Build $BUILD)"
+log "包含的文件夹 / Included folders: ${FOLDERS_TO_PACK[*]}"
