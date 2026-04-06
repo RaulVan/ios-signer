@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.0.20260404c"
+SCRIPT_VERSION="1.0.20260406a"
 
 # ── 全局变量 ────────────────────────────────────────────────────────────────
 CURRENT_DIR="$(pwd)"
@@ -14,7 +14,8 @@ SIGNING_CERTIFICATE=""
 TEAM_ID=""
 BUNDLE_IDENTIFIER=""
 IPHONE_ONLY=false
-IPAD_MULTITASKING_ORIENTATIONS=true
+IPAD_MULTITASKING_ORIENTATIONS="auto"
+APPLIED_IPAD_MULTITASKING_PATCH=false
 OVERRIDE_CERTIFICATE=""
 DISPLAY_NAME=""
 
@@ -34,14 +35,15 @@ show_usage() {
     echo "  -n, --name <应用显示名/name>             修改应用显示名称 / Override app display name (可选/optional)"
     echo "  -c, --certificate <证书名称/certificate> 指定签名证书 / Override signing certificate (可选/optional)"
     echo "      --iphone-only                        移除 iPad 声明，仅保留 iPhone 设备族 / Strip iPad support metadata"
-    echo "      --ipad-multitasking-orientations     (默认已开启) 主应用写入四方向，满足 App Store iPad 多任务校验 / Default on: 4 orientations for iPad multitasking (409)"
-    echo "      --no-ipad-multitasking-orientations  关闭上述默认行为，保留 IPA 内原有方向键 / Disable default orientation rewrite"
+    echo "      --ipad-multitasking-orientations     强制写入四方向，满足特定 iPad 多任务校验 / Force 4 orientations for iPad multitasking"
+    echo "      --no-ipad-multitasking-orientations  禁止自动补齐四方向，完全保留 IPA 原值 / Disable auto orientation patching"
     echo "  -h, --help                               显示此帮助信息 / Show this help message"
     echo
     echo "示例 / Example:"
     echo "  $0 -f app.ipa -p profile.mobileprovision -v 1.0 -b 1"
     echo "  $0 -f app.ipa -p profile.mobileprovision -v 1.0 -b 1 -n 新应用名称"
     echo "  $0 -f app.ipa -p profile.mobileprovision -v 1.0 -b 1 --iphone-only"
+    echo "  $0 -f app.ipa -p profile.mobileprovision -v 1.0 -b 1 --ipad-multitasking-orientations"
     echo "  $0 -f app.ipa -p profile.mobileprovision -v 1.0 -b 1 --no-ipad-multitasking-orientations"
     exit "$exit_code"
 }
@@ -371,6 +373,7 @@ apply_ipad_multitasking_orientations() {
     local key=""
 
     log "写入 iPad 多任务四方向 (UISupportedInterfaceOrientations) / iPad multitasking orientations for App Store validation..."
+    APPLIED_IPAD_MULTITASKING_PATCH=true
 
     for key in ":UISupportedInterfaceOrientations" ":UISupportedInterfaceOrientations~ipad"; do
         /usr/libexec/PlistBuddy -c "Delete $key" "$app_plist" >/dev/null 2>&1 || true
@@ -380,6 +383,83 @@ apply_ipad_multitasking_orientations() {
         /usr/libexec/PlistBuddy -c "Add ${key}:2 string UIInterfaceOrientationLandscapeLeft" "$app_plist"
         /usr/libexec/PlistBuddy -c "Add ${key}:3 string UIInterfaceOrientationLandscapeRight" "$app_plist"
     done
+}
+
+plist_array_contains_value() {
+    local plist_path="$1"
+    local key="$2"
+    local expected="$3"
+    local index=0
+    local actual=""
+
+    while true; do
+        actual=$(/usr/libexec/PlistBuddy -c "Print ${key}:${index}" "$plist_path" 2>/dev/null || true)
+        [ -n "$actual" ] || break
+        [ "$actual" = "$expected" ] && return 0
+        index=$((index + 1))
+    done
+
+    return 1
+}
+
+app_supports_ipad() {
+    local app_plist="$1"
+    plist_array_contains_value "$app_plist" ":UIDeviceFamily" "2"
+}
+
+app_requires_full_screen() {
+    local app_plist="$1"
+    local full_screen=""
+
+    full_screen=$(/usr/libexec/PlistBuddy -c "Print :UIRequiresFullScreen" "$app_plist" 2>/dev/null || true)
+    [ "$full_screen" = "true" ]
+}
+
+orientation_key_has_all_multitasking_values() {
+    local app_plist="$1"
+    local key="$2"
+    local orientation=""
+
+    for orientation in \
+        "UIInterfaceOrientationPortrait" \
+        "UIInterfaceOrientationPortraitUpsideDown" \
+        "UIInterfaceOrientationLandscapeLeft" \
+        "UIInterfaceOrientationLandscapeRight"; do
+        plist_array_contains_value "$app_plist" "$key" "$orientation" || return 1
+    done
+
+    return 0
+}
+
+should_apply_ipad_multitasking_orientations() {
+    local app_plist="$1"
+
+    if [ "$IPAD_MULTITASKING_ORIENTATIONS" = true ]; then
+        return 0
+    fi
+
+    if [ "$IPAD_MULTITASKING_ORIENTATIONS" = false ]; then
+        return 1
+    fi
+
+    if ! app_supports_ipad "$app_plist"; then
+        log "未声明 iPad 设备族，保留原有方向键 / No iPad device family declared, keeping original orientations"
+        return 1
+    fi
+
+    if app_requires_full_screen "$app_plist"; then
+        log "应用要求全屏，保留原有方向键 / UIRequiresFullScreen=true, keeping original orientations"
+        return 1
+    fi
+
+    if orientation_key_has_all_multitasking_values "$app_plist" ":UISupportedInterfaceOrientations" && \
+       orientation_key_has_all_multitasking_values "$app_plist" ":UISupportedInterfaceOrientations~ipad"; then
+        log "已满足 iPad 多任务四方向要求，保留原有方向键 / iPad multitasking orientations already satisfied"
+        return 1
+    fi
+
+    log "检测到 iPad 多任务方向键不完整，将自动补齐四方向 / Incomplete iPad multitasking orientations detected, patching to all four"
+    return 0
 }
 
 apply_main_app_metadata_overrides() {
@@ -403,7 +483,7 @@ apply_main_app_metadata_overrides() {
         /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily:0 integer 1" "$app_plist"
         /usr/libexec/PlistBuddy -c "Delete :UISupportedInterfaceOrientations~ipad" "$app_plist" >/dev/null 2>&1 || true
         /usr/libexec/PlistBuddy -c "Delete :UIDeviceFamily~ipad" "$app_plist" >/dev/null 2>&1 || true
-    elif [ "$IPAD_MULTITASKING_ORIENTATIONS" = true ]; then
+    elif should_apply_ipad_multitasking_orientations "$app_plist"; then
         apply_ipad_multitasking_orientations "$app_plist"
     fi
 }
@@ -550,7 +630,7 @@ validate_final_bundle() {
         /usr/libexec/PlistBuddy -c "Print :UIDeviceFamily" "$app_path/Info.plist"
     fi
 
-    if [ "$IPAD_MULTITASKING_ORIENTATIONS" = true ] && [ "$IPHONE_ONLY" != true ]; then
+    if [ "$APPLIED_IPAD_MULTITASKING_PATCH" = true ] && [ "$IPHONE_ONLY" != true ]; then
         log "验证 iPad 多任务方向键 / Verifying iPad multitasking orientation keys..."
         /usr/libexec/PlistBuddy -c "Print :UISupportedInterfaceOrientations" "$app_path/Info.plist"
         /usr/libexec/PlistBuddy -c "Print :UISupportedInterfaceOrientations~ipad" "$app_path/Info.plist" 2>/dev/null || true
