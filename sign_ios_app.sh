@@ -18,6 +18,7 @@ IPAD_MULTITASKING_ORIENTATIONS="auto"
 APPLIED_IPAD_MULTITASKING_PATCH=false
 OVERRIDE_CERTIFICATE=""
 DISPLAY_NAME=""
+OUTPUT_IPA=""
 
 # 可选：LOG_TIMESTAMPS=true ./sign_ios_app.sh ... 在 CI 日志中显示时间戳
 LOG_TIMESTAMPS="${LOG_TIMESTAMPS:-false}"
@@ -33,6 +34,7 @@ show_usage() {
     echo "  -v, --version <版本号/version>           版本号 / Version number (必需/required)"
     echo "  -b, --build <构建号/build>               构建号 / Build number (必需/required)"
     echo "  -n, --name <应用显示名/name>             修改应用显示名称 / Override app display name (可选/optional)"
+    echo "  -o, --output <输出文件名/output>         自定义输出 IPA 文件名 / Custom output IPA filename (可选/optional)"
     echo "  -c, --certificate <证书名称/certificate> 指定签名证书 / Override signing certificate (可选/optional)"
     echo "      --iphone-only                        移除 iPad 声明，仅保留 iPhone 设备族 / Strip iPad support metadata"
     echo "      --ipad-multitasking-orientations     强制写入四方向，满足特定 iPad 多任务校验 / Force 4 orientations for iPad multitasking"
@@ -42,6 +44,7 @@ show_usage() {
     echo "示例 / Example:"
     echo "  $0 -f app.ipa -p profile.mobileprovision -v 1.0 -b 1"
     echo "  $0 -f app.ipa -p profile.mobileprovision -v 1.0 -b 1 -n 新应用名称"
+    echo "  $0 -f app.ipa -p profile.mobileprovision -v 1.0 -b 1 -o xx.ipa"
     echo "  $0 -f app.ipa -p profile.mobileprovision -v 1.0 -b 1 --iphone-only"
     echo "  $0 -f app.ipa -p profile.mobileprovision -v 1.0 -b 1 --ipad-multitasking-orientations"
     echo "  $0 -f app.ipa -p profile.mobileprovision -v 1.0 -b 1 --no-ipad-multitasking-orientations"
@@ -97,6 +100,10 @@ while [[ $# -gt 0 ]]; do
             DISPLAY_NAME="$2"
             shift 2
             ;;
+        -o|--output)
+            OUTPUT_IPA="$2"
+            shift 2
+            ;;
         -c|--certificate)
             OVERRIDE_CERTIFICATE="$2"
             shift 2
@@ -134,7 +141,22 @@ done
 SOURCE_IPA_ABS="$(cd "$(dirname "$SOURCE_IPA")" && pwd)/$(basename "$SOURCE_IPA")"
 PROVISIONING_PROFILE_ABS="$(cd "$(dirname "$PROVISIONING_PROFILE")" && pwd)/$(basename "$PROVISIONING_PROFILE")"
 
-IPA_NAME="${VERSION}-${BUILD}-${CURRENT_TIME}.ipa"
+if [ -n "${OUTPUT_IPA:-}" ]; then
+    case "$OUTPUT_IPA" in
+        *.ipa) IPA_OUTPUT_PATH="$OUTPUT_IPA" ;;
+        *) IPA_OUTPUT_PATH="${OUTPUT_IPA}.ipa" ;;
+    esac
+else
+    IPA_OUTPUT_PATH="${VERSION}-${BUILD}-${CURRENT_TIME}.ipa"
+fi
+
+if [[ "$IPA_OUTPUT_PATH" = /* ]]; then
+    IPA_OUTPUT_ABS="$IPA_OUTPUT_PATH"
+else
+    IPA_OUTPUT_ABS="$CURRENT_DIR/$IPA_OUTPUT_PATH"
+fi
+
+IPA_NAME="$(basename "$IPA_OUTPUT_ABS")"
 TEMP_DIR="$(mktemp -d "${CURRENT_DIR}/temp_signing.XXXXXX")"
 PROFILE_PLIST="$TEMP_DIR/profile.plist"
 MAIN_ENTITLEMENTS="$TEMP_DIR/entitlements.plist"
@@ -697,7 +719,7 @@ validate_final_bundle "$APP_PATH"
 log "创建 IPA 文件 / Creating IPA..."
 (
     cd "$TEMP_DIR"
-    zip -qr "$CURRENT_DIR/$IPA_NAME" "${FOLDERS_TO_PACK[@]}"
+    zip -qr "$IPA_OUTPUT_ABS" "${FOLDERS_TO_PACK[@]}"
 )
 
 log "✅ IPA 文件已生成 / Generated IPA: $IPA_NAME"

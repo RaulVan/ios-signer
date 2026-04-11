@@ -17,8 +17,12 @@ This is a command-line tool for iOS application re-signing, primarily used for e
 - Support for IPA file re-signing
 - Automatic handling of App Extensions
 - Automatic handling of Embedded Frameworks
-- Preserve all components of the original IPA
+- Remove non-`Payload` content by default before repacking
+- Remove `PlugIns` by default when present
+- Remove `libswift*.dylib` from `Frameworks` by default when present
 - Automatic certificate information extraction and validation
+- AppIcon alpha-channel validation before signing
+- Preserve original orientation settings by default, and only auto-patch iPad multitasking orientations when required by `Info.plist`
 - Detailed logging output
 
 ### Technical Features
@@ -97,6 +101,12 @@ ios_sign -f <ipa_file> -p <profile_file> -v <version> -b <build>
 - `-p, --profile`: Provisioning profile (.mobileprovision) path
 - `-v, --version`: Version number (e.g., 1.0)
 - `-b, --build`: Build number (e.g., 1)
+- `-n, --name`: Override app display name
+- `-o, --output`: Custom output IPA filename
+- `-c, --certificate`: Override signing certificate name
+- `--iphone-only`: Strip iPad metadata and keep only iPhone device family
+- `--ipad-multitasking-orientations`: Force all four orientations for iPad multitasking validation
+- `--no-ipad-multitasking-orientations`: Disable auto orientation patching and keep original `Info.plist` values
 - `-h, --help`: Show help information
 
 #### 2.3 Examples
@@ -106,7 +116,25 @@ ios_sign -h
 
 # Sign application
 ios_sign -f MyApp.ipa -p MyApp.mobileprovision -v 1.0 -b 1
+
+# Override display name
+ios_sign -f MyApp.ipa -p MyApp.mobileprovision -v 1.0 -b 1 -n "My App"
+
+# Set custom output filename
+ios_sign -f MyApp.ipa -p MyApp.mobileprovision -v 1.0 -b 1 -o release-build.ipa
+
+# Force iPad multitasking orientations
+ios_sign -f MyApp.ipa -p MyApp.mobileprovision -v 1.0 -b 1 --ipad-multitasking-orientations
 ```
+
+#### 2.4 Orientation Handling
+- By default the tool preserves the original orientation configuration from `Info.plist`
+- It only auto-patches `UISupportedInterfaceOrientations` when all of the following are true:
+- The app declares iPad support in `UIDeviceFamily`
+- `UIRequiresFullScreen` is not `true`
+- The orientation keys do not already contain all four required values for iPad multitasking
+- Use `--ipad-multitasking-orientations` to force the patch
+- Use `--no-ipad-multitasking-orientations` to disable the auto-patch completely
 
 ### 3. Prerequisites
 
@@ -129,6 +157,7 @@ ios_sign -f MyApp.ipa -p MyApp.mobileprovision -v 1.0 -b 1
 #### 4.1 Generated Files
 - Signed IPA filename format: `version-build-timestamp.ipa`
 - Example: `1.0-3-20250206_122425.ipa`
+- You can override the output filename with `-o`, for example: `release-build.ipa`
 
 #### 4.2 Log Information
 - Shows detailed signing process
@@ -141,6 +170,8 @@ ios_sign -f MyApp.ipa -p MyApp.mobileprovision -v 1.0 -b 1
 - `command not found`: Check installation path and permissions
 - `no identity found`: Check if certificate is properly imported to Keychain
 - `signing verification failed`: Check if certificate and profile match
+- `AppIcon contains alpha`: Replace all AppIcon PNG files with non-alpha RGB images and rebuild/repack the IPA
+- `Invalid bundle ... need to include all orientations to support iPad multitasking`: Review `UIDeviceFamily`, `UIRequiresFullScreen`, and `UISupportedInterfaceOrientations`, or force the patch with `--ipad-multitasking-orientations`
 
 #### 5.2 Solutions
 - Run `security find-identity -v -p codesigning` to view available signing certificates
@@ -179,9 +210,13 @@ sudo rm /usr/local/bin/ios_sign
 ### 7. Features
 
 #### 7.1 Automatic Processing
-- Automatically identifies and preserves all folders from original IPA (Payload, SwiftSupport, Symbols, etc.)
+- Automatically removes content outside `Payload` before repacking
+- Automatically removes `PlugIns` when present
+- Automatically removes `libswift*.dylib` in `Frameworks` when present
 - Automatically extracts certificate information from profile
-- Automatically handles extension signing
+- Automatically handles nested bundles and embedded frameworks signing
+- Automatically validates AppIcon alpha channel before signing
+- Automatically decides whether iPad multitasking orientation patching is required
 
 #### 7.2 Security Features
 - Uses temporary directory for processing, avoiding original file pollution
@@ -205,8 +240,12 @@ sudo rm /usr/local/bin/ios_sign
 - 支持 IPA 文件的重签名
 - 自动处理应用扩展（App Extensions）
 - 自动处理嵌入式框架（Embedded Frameworks）
-- 保留原始 IPA 的所有组件
+- 默认删除 `Payload` 之外的文件和目录
+- 默认删除 `PlugIns` 目录（存在时）
+- 默认删除 `Frameworks` 下的 `libswift*.dylib`（存在时）
 - 自动提取和验证证书信息
+- 签名前自动检测 AppIcon 是否包含透明通道
+- 默认保留原始横竖屏配置，仅在 `Info.plist` 条件满足时自动补齐 iPad 多任务四方向
 - 提供详细的日志输出
 
 ### 技术特点
@@ -285,6 +324,12 @@ ios_sign -f <ipa文件> -p <描述文件> -v <版本号> -b <构建号>
 - `-p, --profile`: 描述文件(.mobileprovision)路径
 - `-v, --version`: 版本号（如：1.0）
 - `-b, --build`: 构建号（如：1）
+- `-n, --name`: 修改应用显示名称
+- `-o, --output`: 自定义输出 IPA 文件名
+- `-c, --certificate`: 指定签名证书名称
+- `--iphone-only`: 移除 iPad 声明，仅保留 iPhone 设备族
+- `--ipad-multitasking-orientations`: 强制补齐 iPad 多任务所需四方向
+- `--no-ipad-multitasking-orientations`: 禁止自动补方向键，完全保留原始 `Info.plist`
 - `-h, --help`: 显示帮助信息
 
 #### 2.3 使用示例
@@ -294,7 +339,25 @@ ios_sign -h
 
 # 签名应用
 ios_sign -f MyApp.ipa -p MyApp.mobileprovision -v 1.0 -b 1
+
+# 修改显示名称
+ios_sign -f MyApp.ipa -p MyApp.mobileprovision -v 1.0 -b 1 -n "新应用名称"
+
+# 自定义输出文件名
+ios_sign -f MyApp.ipa -p MyApp.mobileprovision -v 1.0 -b 1 -o release-build.ipa
+
+# 强制补齐 iPad 多任务四方向
+ios_sign -f MyApp.ipa -p MyApp.mobileprovision -v 1.0 -b 1 --ipad-multitasking-orientations
 ```
+
+#### 2.4 横竖屏处理策略
+- 默认保留 IPA 原始 `Info.plist` 中的横竖屏配置
+- 只有同时满足以下条件时，脚本才会自动补齐 `UISupportedInterfaceOrientations` 四方向：
+- `UIDeviceFamily` 声明支持 iPad
+- `UIRequiresFullScreen` 不为 `true`
+- 当前方向键尚未包含 iPad 多任务要求的四个方向
+- `--ipad-multitasking-orientations` 可强制补齐四方向
+- `--no-ipad-multitasking-orientations` 可完全关闭自动补丁
 
 ### 3. 注意事项
 
@@ -317,6 +380,7 @@ ios_sign -f MyApp.ipa -p MyApp.mobileprovision -v 1.0 -b 1
 #### 4.1 生成文件
 - 签名后的IPA文件名格式：`版本号-构建号-时间戳.ipa`
 - 例如：`1.0-3-20250206_122425.ipa`
+- 可通过 `-o` 指定自定义输出文件名，例如：`release-build.ipa`
 
 #### 4.2 日志信息
 - 显示签名过程的详细信息
@@ -329,6 +393,8 @@ ios_sign -f MyApp.ipa -p MyApp.mobileprovision -v 1.0 -b 1
 - `command not found`: 检查安装路径和权限
 - `no identity found`: 检查证书是否正确导入钥匙串
 - `验证签名失败`: 检查证书和描述文件是否匹配
+- `检测到 AppIcon 存在透明度`: 需要将所有 AppIcon PNG 替换为无 alpha 的 RGB 图片后重新打包
+- `Invalid bundle ... need to include all orientations to support iPad multitasking`: 检查 `UIDeviceFamily`、`UIRequiresFullScreen` 与方向键配置，必要时使用 `--ipad-multitasking-orientations`
 
 #### 5.2 解决方法
 - 运行 `security find-identity -v -p codesigning` 查看可用的签名证书
@@ -367,9 +433,13 @@ sudo rm /usr/local/bin/ios_sign
 ### 7. 功能特性
 
 #### 7.1 自动处理
-- 自动识别并保留原始IPA中的所有文件夹（如 Payload、SwiftSupport、Symbols 等）
+- 重新打包前自动删除 `Payload` 之外的内容
+- 自动删除 `PlugIns` 目录（存在时）
+- 自动删除 `Frameworks` 下的 `libswift*.dylib`（存在时）
 - 自动从描述文件中提取证书信息
-- 自动处理扩展插件的签名
+- 自动处理嵌套 Bundle 与嵌入式 Framework 的签名
+- 自动执行 AppIcon alpha 检查
+- 自动判断是否需要补齐 iPad 多任务方向键
 
 #### 7.2 安全特性
 - 使用临时目录处理文件，避免污染原始文件
