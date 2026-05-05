@@ -18,6 +18,7 @@ This is a command-line tool for iOS application re-signing, primarily used for e
 - Automatic handling of App Extensions
 - Automatic handling of Embedded Frameworks
 - Remove non-`Payload` content by default before repacking
+- Remove macOS archive metadata such as `__MACOSX`, `.DS_Store`, and `._*`
 - Remove `PlugIns` by default when present
 - Remove `libswift*.dylib` from `Frameworks` by default when present
 - Automatic certificate information extraction and validation
@@ -211,6 +212,7 @@ sudo rm /usr/local/bin/ios_sign
 
 #### 7.1 Automatic Processing
 - Automatically removes content outside `Payload` before repacking
+- Automatically removes macOS archive metadata such as `__MACOSX`, `.DS_Store`, and `._*`
 - Automatically removes `PlugIns` when present
 - Automatically removes `libswift*.dylib` in `Frameworks` when present
 - Automatically extracts certificate information from profile
@@ -241,6 +243,7 @@ sudo rm /usr/local/bin/ios_sign
 - 自动处理应用扩展（App Extensions）
 - 自动处理嵌入式框架（Embedded Frameworks）
 - 默认删除 `Payload` 之外的文件和目录
+- 默认清理 `__MACOSX`、`.DS_Store`、`._*` 等 macOS 归档元数据
 - 默认删除 `PlugIns` 目录（存在时）
 - 默认删除 `Frameworks` 下的 `libswift*.dylib`（存在时）
 - 自动提取和验证证书信息
@@ -434,6 +437,7 @@ sudo rm /usr/local/bin/ios_sign
 
 #### 7.1 自动处理
 - 重新打包前自动删除 `Payload` 之外的内容
+- 自动清理 `__MACOSX`、`.DS_Store`、`._*` 等 macOS 归档元数据
 - 自动删除 `PlugIns` 目录（存在时）
 - 自动删除 `Frameworks` 下的 `libswift*.dylib`（存在时）
 - 自动从描述文件中提取证书信息

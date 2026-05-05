@@ -280,6 +280,30 @@ remove_old_signature() {
     find "$target" -name ".DS_Store" -type f -delete 2>/dev/null || true
 }
 
+clean_unrelated_metadata() {
+    local temp_root="$1"
+    local metadata_path=""
+    local relative_path=""
+    local found_any=false
+
+    log "清理无关元数据 / Removing unrelated archive metadata..."
+    while IFS= read -r metadata_path; do
+        [ -e "$metadata_path" ] || continue
+        found_any=true
+        relative_path="${metadata_path#"$temp_root"/}"
+        log "删除元数据 / Removing metadata: $relative_path"
+        rm -rf "$metadata_path"
+    done < <(
+        find "$temp_root" \
+            \( -type d \( -name "__MACOSX" -o -name ".Spotlight-V100" -o -name ".Trashes" -o -name ".fseventsd" \) -print -prune \) -o \
+            \( -type f \( -name ".DS_Store" -o -name "._*" -o -name ".VolumeIcon.icns" \) -print \)
+    )
+
+    if [ "$found_any" = false ]; then
+        log "未发现无关元数据 / No unrelated metadata found, skipping"
+    fi
+}
+
 prune_non_payload_content() {
     local temp_root="$1"
     local entry=""
@@ -667,6 +691,7 @@ validate_final_bundle() {
 log "创建临时工作目录 / Creating temporary directory: $TEMP_DIR"
 log "解压 IPA 文件 / Extracting IPA file..."
 unzip -q "$SOURCE_IPA_ABS" -d "$TEMP_DIR"
+clean_unrelated_metadata "$TEMP_DIR"
 prune_non_payload_content "$TEMP_DIR"
 
 log "检查解压后的文件夹结构 / Checking extracted folder structure..."
